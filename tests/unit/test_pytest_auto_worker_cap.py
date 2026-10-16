@@ -20,8 +20,12 @@ def _auto_workers(config):
     return config.hook.pytest_xdist_auto_num_workers(config=config)
 
 
-def test_local_auto_is_capped_at_four_on_a_many_core_machine(request, monkeypatch):
-    monkeypatch.delenv("CI", raising=False)
+@pytest.mark.parametrize("ci", [None, "0", "false"])
+def test_local_auto_is_capped_at_four_on_a_many_core_machine(request, monkeypatch, ci):
+    if ci is None:
+        monkeypatch.delenv("CI", raising=False)
+    else:
+        monkeypatch.setenv("CI", ci)
     monkeypatch.delenv("CWNG_PYTEST_AUTO_WORKERS", raising=False)
     monkeypatch.setattr(os, "cpu_count", lambda: 16)
 

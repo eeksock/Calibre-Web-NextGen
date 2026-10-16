@@ -682,15 +682,15 @@ def pytest_configure(config):
 # starves everything else: parallel worktrees each running `-n auto` beside
 # Docker drove the 5-minute load to 680 and blocked other builds for hours.
 # Outside CI, `auto` therefore means at most LOCAL_AUTO_WORKER_CAP workers.
-# CI runners are dedicated, so there `auto` keeps xdist's own answer. An
-# explicit `-n 8` is never touched.
+# CI runners are dedicated, so there `auto` keeps xdist's own answer (CI set
+# to anything but empty, "0" or "false"). An explicit `-n 8` is never touched.
 
 LOCAL_AUTO_WORKER_CAP = 4
 
 
 @pytest.hookimpl(optionalhook=True)
 def pytest_xdist_auto_num_workers(config):
-    if os.environ.get("CI"):
+    if os.environ.get("CI", "").strip().lower() not in ("", "0", "false"):
         return None
     override = os.environ.get("CWNG_PYTEST_AUTO_WORKERS", "").strip()
     if override.isdigit() and int(override) > 0:

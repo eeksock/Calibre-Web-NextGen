@@ -3591,7 +3591,7 @@ def HandleSyncRequest():
                 "x-kobo-recent-reads",
             }
         }
-        kobo_sync_status.stage_pending_sync_page(
+        _page_args = (
             requesting_device_id,
             _sync_token_hash(raw_sync_token),
             response.headers[SyncToken.SyncToken.SYNC_TOKEN_HEADER],
@@ -3599,7 +3599,10 @@ def HandleSyncRequest():
             json.dumps(stored_headers, separators=(",", ":")),
             _serialize_pending_confirmation(confirmation),
         )
+        _page_durable = _stage_pending_page_best_effort(*_page_args)
     else:
+        _page_args = None
+        _page_durable = None
         # Authenticated production requests resolve a physical device. Keep the
         # historical fallback for synthetic callers that do not supply one.
         kobo_sync_status.add_synced_books_batch(
@@ -3631,16 +3634,50 @@ def HandleSyncRequest():
     # This commit makes only the replayable response durable. Confirmed
     # delivery state was promoted at the beginning of this request (when its
     # predecessor token was presented) and lands atomically with this page.
-    if ub.session_commit() is False:
-        return _abort_sync_with_observability(
-            503,
+    #
+    # STOPGAP: a library task may hold the app.db writer for minutes, so this
+    # is best-effort too. Try briefly, then deliver the response anyway and
+    # roll back, so a half-written transaction cannot poison later requests.
+    _commit_deadline = time.monotonic() + _PENDING_STAGE_RETRY_BUDGET_S
+    _commit_ok = False
+    while True:
+        if ub.session_commit() is not False:
+            _commit_ok = True
+            break
+        if time.monotonic() >= _commit_deadline:
+            break
+        log.warning(
+            "Kobo Sync: replayable page commit lost the app.db writer; "
+            "retrying with a rollback",
+        )
+        if _page_args is not None:
+            try:
+                _stage_pending_page_best_effort(*_page_args)
+            except Exception:  # noqa: BLE001 - decision below stands
+                log.warning("Kobo Sync: re-staging after a lost commit failed")
+        time.sleep(_PENDING_STAGE_RETRY_SLEEP_S)
+    if not _commit_ok:
+        try:
+            ub.session.rollback()
+        except Exception:  # noqa: BLE001
+            pass
+        log.warning(
+            "Kobo Sync: app.db writer unavailable; delivered the response "
+            "without committing (next sync will be a full one)",
+        )
+        _page_durable = False
+    if _page_durable is False:
+        # The page is missing but the response is sound: say so, and let the
+        # device re-sync in full rather than pretend the delta is replayable.
+        _log_sync_observability(
             requesting_device_id,
             sync_cursor_in,
-            response_mode="commit_failed",
+            sync_cursor_out,
+            observability,
+            response_mode="delivered_page_not_durable",
             capture_session=capture_session,
-            outgoing_cursor=sync_cursor_out,
-            observability=observability,
         )
+        return response
     _mark_pending_page_reset_staged(False)
     _log_sync_observability(
         requesting_device_id,
@@ -3651,6 +3688,88 @@ def HandleSyncRequest():
         capture_session=capture_session,
     )
     return response
+
+
+# ---------------------------------------------------------------------------
+# Local runtime stopgap: app.db writer contention on the sync's final write.
+#
+# CWA's background library tasks (the KEPUB package repair and backfill sweeps)
+# hold an app.db write transaction ACROSS their file work, in multi-second to
+# multi-minute stretches, while they sweep the library. With no incoming token a
+# sync is a fresh full emit and the staging upsert below is its ONLY write, so a
+# lost writer kills a request whose response was already fully built: the device
+# shows "Sync Failed" and its library never arrives.
+#
+# No retry budget rides out a minutes-long hold, so this patch inverts the
+# priority: the RESPONSE is the deliverable and the staged page is only the
+# replayable copy used to make the next sync a delta. Try briefly, then deliver
+# anyway. With no stored page the next request skips the replay block in
+# HandleSyncRequest and does a fresh full sync: no error, no 503, nothing lost,
+# just a full sync instead of a delta until the contention is fixed upstream.
+# ---------------------------------------------------------------------------
+import time  # noqa: E402 - patch keeps the import beside its use
+
+_PENDING_STAGE_RETRY_BUDGET_S = 3.0
+_PENDING_STAGE_RETRY_SLEEP_S = 1.0
+_PENDING_STAGE_ATTEMPT_TIMEOUT_MS = 1500
+
+
+def _stage_pending_page_best_effort(*args):
+    """Stage the replayable page if the writer is free; never fail the sync.
+
+    Returns True when the page is durable, False when it was skipped.
+    """
+    connection = ub.session.connection()
+    driver = connection.connection.driver_connection
+    previous_timeout = None
+    try:
+        previous_timeout = driver.execute("PRAGMA busy_timeout").fetchone()[0]
+    except Exception:  # noqa: BLE001 - only used to restore the PRAGMA
+        pass
+    deadline = time.monotonic() + _PENDING_STAGE_RETRY_BUDGET_S
+    attempt = 0
+    try:
+        try:
+            driver.execute(
+                "PRAGMA busy_timeout=%d" % _PENDING_STAGE_ATTEMPT_TIMEOUT_MS,
+            )
+        except Exception:  # noqa: BLE001 - attempts still work on old timeout
+            pass
+        while True:
+            attempt += 1
+            try:
+                kobo_sync_status.stage_pending_sync_page(*args)
+                if attempt > 1:
+                    log.info(
+                        "Kobo Sync: pending page staged on attempt %s after "
+                        "app.db writer contention", attempt,
+                    )
+                return True
+            except Exception as error:  # noqa: BLE001 - only lock errors retry
+                if "locked" not in str(error).lower():
+                    raise
+                if time.monotonic() >= deadline:
+                    log.warning(
+                        "Kobo Sync: app.db writer held by a library task for "
+                        "%.0fs; delivering the response without a staged page",
+                        _PENDING_STAGE_RETRY_BUDGET_S,
+                    )
+                    try:
+                        ub.session.rollback()
+                    except Exception:  # noqa: BLE001
+                        pass
+                    return False
+                try:
+                    ub.session.rollback()
+                except Exception:  # noqa: BLE001
+                    pass
+                time.sleep(_PENDING_STAGE_RETRY_SLEEP_S)
+    finally:
+        try:
+            if previous_timeout is not None:
+                driver.execute("PRAGMA busy_timeout=%d" % int(previous_timeout))
+        except Exception:  # noqa: BLE001
+            pass
 
 
 def _dispatch_sync_request():
